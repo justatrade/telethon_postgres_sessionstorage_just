@@ -4,11 +4,18 @@ import typing
 
 import psycopg2
 import psycopg2.pool
-
-from telethon.sessions import SQLiteSession, MemorySession
-from telethon.sessions.sqlite import CURRENT_VERSION
+from psycopg2.extensions import AsIs
+from telethon.client.telegrambaseclient import (
+    DEFAULT_DC_ID,
+    DEFAULT_IPV4_IP,
+    DEFAULT_PORT,
+)
 from telethon.crypto import AuthKey
+from telethon.sessions import MemorySession, SQLiteSession
+from telethon.sessions.sqlite import CURRENT_VERSION
 from telethon.tl import types
+
+from config import settings
 
 
 POSTGRES_SQL_VERSION = 7
@@ -17,6 +24,7 @@ if POSTGRES_SQL_VERSION != CURRENT_VERSION:
 
 Values = typing.Optional[
     typing.Union[
+        list[tuple[typing.Any]],
         tuple[typing.Any],
         dict[str, typing.Any],
         typing.Iterable[dict[str, typing.Any]],
@@ -36,30 +44,33 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
     Telethon Session class for store data in postgresql database
     """
 
-    def __init__(
-        self,
-        dbname: str,
-        schema: str,
-        username: str,
-        password: str,
-        host: str = "127.0.0.1",
-        port: int = 5432,
-        min_pool_connections: int = 1,
-        max_pool_connections: int = 10,
-    ):
+    _service_schema_names = [
+        "public",
+        "information_schema",
+        "pg_catalog",
+        "pg_toast",
+    ]
 
+    def __init__(self, user_schema: str):
         MemorySession.__init__(self)
 
+        if user_schema in self._service_schema_names:
+            raise ValueError("Using service schema names is prohibited")
+
+        self._user_schema = user_schema
+        self._create_schema(self._user_schema)
+
         self._pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=min_pool_connections,
-            maxconn=max_pool_connections,
-            user=username,
-            password=password,
-            host=host,
-            port=port,
-            database=dbname,
-            options=f"-c search_path={schema}",
+            minconn=settings.min_pool_connections,
+            maxconn=settings.max_pool_connections,
+            user=settings.db_username,
+            password=settings.db_password,
+            host=settings.db_host,
+            port=settings.db_port,
+            database=settings.db_name,
+            options=f"-c search_path={self._user_schema}",
         )
+        self._conn = None
 
         self.save_entities = True
 
@@ -73,7 +84,7 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
                 table_schema = %(schema)s
                 and table_name = 'version'
             """,
-            {"schema": schema},
+            {"schema": self._user_schema},
         )
 
         if tables_exist:
@@ -103,7 +114,7 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
                 key,
                 self._takeout_id,
             ) = tuple_
-            self._auth_key = AuthKey(data=key.tobytes())
+            self._auth_key = AuthKey(data=bytes(key))
 
     def _create_tables(self) -> None:
         self._create_table(
@@ -113,11 +124,11 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
                 server_address text,
                 port integer,
                 auth_key bytea,
-                takeout_id integer
+                takeout_id bigint
             )""",
             """entities (
-                id integer primary key,
-                hash bigint not null,
+                id bigint primary key,
+                hash numeric(25,0) not null,
                 username text,
                 phone bigint,
                 name text,
@@ -132,10 +143,10 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
                 primary key(md5_digest, file_size, type)
             )""",
             """update_state (
-                id integer primary key,
+                id bigint primary key,
                 pts integer,
                 qts integer,
-                date integer,
+                date bigint,
                 seq integer
             )""",
         )
@@ -145,51 +156,13 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
     def save(self) -> None:
         pass
 
-    def _execute(
-        self,
-        stmt: str,
-        values: Values = None,
-        fetchone: bool = True,
-        fetchall: bool = False,
-        executemany: bool = False,
-    ) -> ExecuteResults:
-
-        if all((fetchone, fetchall)):
-            raise ValueError("Choose fetchall or fetchone")
-
-        connection = self._pool.getconn()
-        connection.autocommit = True
-        cursor = connection.cursor()
-
-        try:
-
-            if executemany:
-                cursor.executemany(stmt, values)
-            else:
-                cursor.execute(stmt, values)
-
-            results = cursor.rowcount
-
-            if results:
-                if fetchall:
-                    return cursor.fetchall()  # type: ignore
-                elif fetchone:
-                    return cursor.fetchone()  # type: ignore
-                else:
-                    return None
-            else:
-                return None
-        finally:
-            cursor.close()
-            self._pool.putconn(connection)
-
     def fetchall(
         self,
         stmt: str,
         values: Values = None,
-    ) -> typing.Optional[list[list[typing.Any]]]:
-        return self._execute(
-            stmt, values, fetchall=True, fetchone=False, executemany=False
+    ) -> ExecuteResults:
+        return self.execute(
+            stmt, values, fetchone=False, fetchall=True, executemany=False
         )
 
     def fetchone(
@@ -197,30 +170,93 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
         stmt: str,
         values: Values = None,
     ) -> typing.Optional[list[typing.Any]]:
-        return self._execute(
-            stmt, values, fetchall=False, fetchone=True, executemany=False
+        return self.execute(
+            stmt, values, fetchone=True, fetchall=False, executemany=False
         )
+
+    def _cursor(self):
+        """Asserts that the connection is open and returns a cursor"""
+        if self._conn is None:
+            self._conn = self._pool.getconn()
+            self._conn.autocommit = True
+        return self._conn.cursor()
+
+    def _execute(self, stmt, *values):
+        """
+        Gets a cursor, executes `stmt` and closes the cursor,
+        fetching one row afterwards and returning its result.
+        """
+        with self._cursor() as cursor:
+            try:
+                cursor.execute(stmt, values)
+                if cursor.rowcount > 0 and stmt[:6] not in [
+                    "insert",
+                    "update",
+                    "delete",
+                ]:
+                    return cursor.fetchone()
+                else:
+                    return None
+            except psycopg2.ProgrammingError:
+                return None
+            finally:
+                cursor.close()
+                self._pool.putconn(self._conn)
+                self._conn = None
 
     def execute(
         self,
         stmt: str,
         values: Values = None,
+        fetchone=True,
+        fetchall=False,
+        executemany=False,
     ) -> None:
-        self._execute(
-            stmt, values, fetchall=False, fetchone=False, executemany=False
-        )
+        if all((fetchone, fetchall)):
+            raise ValueError("Choose fetchall or fetchone")
+
+        with self._cursor() as cursor:
+            try:
+                if executemany:
+                    cursor.executemany(stmt, values)
+                else:
+                    cursor.execute(stmt, values)
+                results = cursor.rowcount
+
+                if results > 0 and stmt[:6] not in [
+                    "insert",
+                    "update",
+                    "delete",
+                ]:
+                    if fetchall:
+                        return cursor.fetchall()  # type: ignore
+                    elif fetchone:
+                        return cursor.fetchone()  # type: ignore
+                    else:
+                        return None
+                else:
+                    return None
+            except psycopg2.ProgrammingError:
+                return None
+            finally:
+                cursor.close()
+                self._pool.putconn(self._conn)
+                self._conn = None
 
     def executemany(
         self,
         stmt: str,
         values: Values = None,
     ) -> ExecuteResults:
-        return self._execute(
+        return self.execute(
             stmt, values, fetchall=False, fetchone=False, executemany=True
         )
 
     def close(self) -> None:
-        raise NotImplementedError
+        if self._conn is not None:
+            self._conn.commit()
+            self._conn.close()
+            self._conn = None
 
     def delete(self) -> None:
         raise NotImplementedError
@@ -234,11 +270,18 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
         self.execute("delete from sessions")
 
         # data from MemorySession.__init__
+        auth_key = (
+            psycopg2.Binary(self._auth_key.key) if self._auth_key else b""
+        )
         data = {
-            "dc_id": self._dc_id,
-            "server": self._server_address,
-            "port": self._port,
-            "auth_key": self._auth_key.key if self._auth_key else b"",
+            "dc_id": self._dc_id if self._dc_id else DEFAULT_DC_ID,
+            "server": (
+                self._server_address
+                if self._server_address
+                else DEFAULT_IPV4_IP
+            ),
+            "port": self._port if self._port else DEFAULT_PORT,
+            "auth_key": auth_key,
             "takeout_id": self._takeout_id,
         }
 
@@ -268,7 +311,7 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
 
     def process_entities(self, tlo: typing.Any) -> None:
 
-        print("process_entities", tlo, type(tlo))
+        logger.debug("process_entities", tlo, type(tlo))
 
         if not self.save_entities:
             return
@@ -332,8 +375,9 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
         self._update_session_table()
 
         row = self.fetchall("select auth_key from sessions")
-        if row and row[0]:
-            self._auth_key = AuthKey(data=row[0])
+        logger.debug(f"Row with auth_key = {row}")
+        if row and row[0] and row[0][0]:
+            self._auth_key = AuthKey(data=row[0][0].tobytes())
         else:
             self._auth_key = None
 
@@ -342,7 +386,7 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
             "select id, pts, qts, date, seq from update_state"
         )
 
-        print("get_update_states", rows)
+        logger.debug("get_update_states", rows)
 
         if not rows:
             raise ValueError("update_states select return nothing")
@@ -401,9 +445,9 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
             self._create_table(
                 """sent_files (
                     md5_digest bytea,
-                    file_size integer,
+                    file_size bigint,
                     type integer,
-                    id integer,
+                    id bigint,
                     hash integer,
                     primary key(md5_digest, file_size, type)
                 )""",
@@ -439,3 +483,35 @@ class PostgresqlSession(SQLiteSession):  # type: ignore
         for definition in definitions:
             self.execute(f"create table {definition}")
 
+    @staticmethod
+    def _get_direct_db_connect(self):
+        return psycopg2.connect(
+            host=settings.db_host,
+            port=settings.db_port,
+            dbname=settings.db_name,
+            user=settings.db_username,
+            password=settings.db_password,
+        )
+
+    def _create_schema(self, schema_name):
+        with self._get_direct_db_connect(self) as conn:
+            with conn.cursor() as cur:
+                query = """
+                create schema if not exists %s
+                """
+                cur.execute(query, (AsIs(schema_name),))
+
+    def set_update_state(self, entity_id, state):
+        self._execute(
+            "insert into update_state values (%s, %s, %s, %s, %s) "
+            "on conflict (id) do update set "
+            "pts = excluded.pts, "
+            "qts = excluded.qts, "
+            "date = excluded.date, "
+            "seq = excluded.seq;",
+            entity_id,
+            state.pts,
+            state.qts,
+            state.date.timestamp(),
+            state.seq,
+        )
